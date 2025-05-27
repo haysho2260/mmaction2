@@ -1,9 +1,11 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+# python '/code/hchang27/mmaction2/demo/demo_spatiotemporal_det.py'  '/files/pathml/aim2/videos/CP/Participant 9/P9_TUG.mp4'  P9_TUG.mp4  --device "cuda:0" 
 import argparse
 import copy as cp
 import tempfile
 
 import cv2
+import csv
 import mmcv
 import mmengine
 import numpy as np
@@ -11,12 +13,14 @@ import torch
 from mmengine import DictAction
 from mmengine.runner import load_checkpoint
 from mmengine.structures import InstanceData
+import ffmpeg
+import os
 
 from mmaction.apis import detection_inference
 from mmaction.registry import MODELS
 from mmaction.structures import ActionDataSample
 from mmaction.utils import frame_extract, get_str_type
-
+torch.cuda.empty_cache()
 try:
     import moviepy.editor as mpy
 except ImportError:
@@ -28,7 +32,6 @@ FONTCOLOR = (255, 255, 255)  # BGR, white
 MSGCOLOR = (128, 128, 128)  # BGR, gray
 THICKNESS = 1
 LINETYPE = 1
-
 
 def hex2color(h):
     """Convert the 6-digit hex string to tuple of 3 int value (RGB)"""
@@ -43,13 +46,13 @@ plate_green = plate_green.split('-')
 plate_green = [hex2color(h) for h in plate_green]
 
 
-def visualize(frames, annotations, plate=plate_blue, max_num=5):
-    """Visualize frames with predicted annotations.
+def visualize(frames, annotations, tracking_ids, plate=plate_blue, max_num=5):
+    """Visualize frames with predicted annotations and tracking IDs.
 
     Args:
-        frames (list[np.ndarray]): Frames for visualization, note that
-            len(frames) % len(annotations) should be 0.
+        frames (list[np.ndarray]): Frames for visualization.
         annotations (list[list[tuple]]): The predicted results.
+        tracking_ids (list[np.ndarray]): List of tracking IDs for each frame.
         plate (str): The plate used for visualization. Default: plate_blue.
         max_num (int): Max number of labels to visualize for a person box.
             Default: 5.
@@ -66,14 +69,17 @@ def visualize(frames, annotations, plate=plate_blue, max_num=5):
     anno = None
     h, w, _ = frames[0].shape
     scale_ratio = np.array([w, h, w, h])
+    
     for i in range(na):
         anno = annotations[i]
         if anno is None:
             continue
+        frame_track_ids = tracking_ids[i] if tracking_ids is not None and i < len(tracking_ids) else None
+        
         for j in range(nfpa):
             ind = i * nfpa + j
             frame = frames_out[ind]
-            for ann in anno:
+            for ann_idx, ann in enumerate(anno):
                 box = ann[0]
                 label = ann[1]
                 if not len(label):
@@ -82,6 +88,27 @@ def visualize(frames, annotations, plate=plate_blue, max_num=5):
                 box = (box * scale_ratio).astype(np.int64)
                 st, ed = tuple(box[:2]), tuple(box[2:])
                 cv2.rectangle(frame, st, ed, plate[0], 2)
+
+                # Add tracking ID if available
+                if frame_track_ids is not None and ann_idx < len(frame_track_ids):
+                    track_id = frame_track_ids[ann_idx]
+                    if track_id >= 0:  # Only show valid tracking IDs
+                        id_text = f'ID: {track_id}'
+                        id_location = (st[0], st[1] - 5)
+                        
+                        # Get text size for background box
+                        (text_width, text_height), baseline = cv2.getTextSize(
+                            id_text, FONTFACE, FONTSCALE, THICKNESS)
+                        
+                        # Draw white background rectangle
+                        box_pt1 = (id_location[0], id_location[1] - text_height - baseline)
+                        box_pt2 = (id_location[0] + text_width, id_location[1] + baseline)
+                        cv2.rectangle(frame, box_pt1, box_pt2, (255, 255, 255), -1)
+                        
+                        # Draw black text
+                        cv2.putText(frame, id_text, id_location, FONTFACE, FONTSCALE,
+                                    (0, 0, 0), THICKNESS, LINETYPE)
+
                 for k, lb in enumerate(label):
                     if k >= max_num:
                         break
@@ -99,6 +126,96 @@ def visualize(frames, annotations, plate=plate_blue, max_num=5):
 
     return frames_out
 
+def log(frames, annotations, video, max_num=5, output_csv=None, fps=30, ids=None):
+    """Log predicted annotations into a CSV file instead of visualizing.
+
+    Args:
+        frames (list[np.ndarray]): Frames used for predictions.
+        annotations (list[list[tuple]]): The predicted results.
+        video (str): Path to video file.
+        max_num (int): Max number of labels to log for each person box.
+        output_csv (str, optional): Path to output CSV file. If None, creates a new numbered file.
+        fps (int): Frames per second of the video.
+        ids (list[np.ndarray], optional): List of tracking IDs for each frame's detections.
+    Returns:
+        list[np.ndarray]: Original frames (unchanged).
+    """
+    frames_out = cp.deepcopy(frames)
+    nf, na = len(frames), len(annotations)
+    assert nf % na == 0
+    nfpa = nf // na
+    h, w, _ = frames[0].shape
+    scale_ratio = np.array([w, h, w, h])
+
+    base_filename = os.path.basename(video)
+    folder_path = os.path.dirname(os.path.abspath(__file__))
+    folder_path = os.path.join(folder_path, "mmaction_result")
+    os.makedirs(folder_path, exist_ok=True)
+
+    # Use provided output CSV or create a new numbered file
+    if output_csv:
+        csv_filename = output_csv
+    else:
+        # Start with default name
+        base_result_filename = 'results_'
+        ext = '.csv'
+        i = 0
+        while True:
+            csv_filename = os.path.join(folder_path, f'{base_result_filename}{i}{ext}')
+            if not os.path.exists(csv_filename):
+                break
+            i += 1
+
+    # Check if we need to write headers
+    file_exists = os.path.exists(csv_filename)
+    mode = 'a' if file_exists else 'w'
+    
+    with open(csv_filename, mode, newline='') as f:
+        writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
+        
+        # Write headers only if file is new
+        if not file_exists:
+            writer.writerow(
+                ['filename', 'frame', 'fps', 'track_id'] + 
+                [elem for i in range(max_num) for elem in [f'action_label_{i}', f'action_score_{i}']] + 
+                ['bbox_x1', 'bbox_y1', 'bbox_x2', 'bbox_y2']
+            )
+
+        for i in range(na):
+            anno = annotations[i]
+            if anno is None:
+                continue
+            
+            frame_ids = ids[i] if ids is not None and i < len(ids) else None
+            
+            for j in range(nfpa):
+                ind = i * nfpa + j
+                for ann_idx, ann in enumerate(anno):
+                    box = ann[0]
+                    labels = ann[1]
+                    scores = ann[2]
+
+                    if not len(labels):
+                        continue
+
+                    box = (box * scale_ratio).astype(np.int64)
+                    x1, y1, x2, y2 = box
+
+                    label_texts = []
+                    for k in range(max_num):
+                        if k >= len(labels):
+                            label = "Not found"
+                            score = -1
+                        else:
+                            label = labels[k]
+                            score = scores[k]
+                        label_texts.extend([label.replace(",", ";"), score])
+
+                    track_id = frame_ids[ann_idx] if frame_ids is not None and ann_idx < len(frame_ids) else -1
+                    writer.writerow([base_filename, ind, fps, track_id] + label_texts + [x1, y1, x2, y2])
+    
+    print(f"Results {'appended to' if file_exists else 'written to'} {csv_filename}")
+    return frames_out
 
 def load_label_map(file_path):
     """Load Label Map.
@@ -151,7 +268,10 @@ def pack_result(human_detection, result, img_h, img_w):
 def parse_args():
     parser = argparse.ArgumentParser(description='MMAction2 demo')
     parser.add_argument('video', help='video file/url')
-    parser.add_argument('out_filename', help='output filename')
+    parser.add_argument(
+        '--output-csv',
+        help='Path to output CSV file. If not provided, will create a new numbered file.'
+    )
     parser.add_argument(
         '--config',
         default=('configs/detection/slowonly/slowonly_kinetics400-pretrained-'
@@ -166,19 +286,16 @@ def parse_args():
         help='spatialtemporal detection model checkpoint file/url')
     parser.add_argument(
         '--det-config',
-        default='demo/demo_configs/faster-rcnn_r50_fpn_2x_coco_infer.py',
+        default='/code/hchang27/mmaction2/configs/detection_configs/cascade_rcnn/cascade-mask-rcnn_x101-64x4d_fpn_20e_coco.py',
         help='human detection config file path (from mmdet)')
     parser.add_argument(
         '--det-checkpoint',
-        default=('http://download.openmmlab.com/mmdetection/v2.0/faster_rcnn/'
-                 'faster_rcnn_r50_fpn_2x_coco/'
-                 'faster_rcnn_r50_fpn_2x_coco_'
-                 'bbox_mAP-0.384_20200504_210434-a5d8aa15.pth'),
+        default=('https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11x.pt'),
         help='human detection checkpoint file/url')
     parser.add_argument(
         '--det-score-thr',
         type=float,
-        default=0.9,
+        default=0.7,
         help='the threshold of human detection score')
     parser.add_argument(
         '--det-cat-id',
@@ -188,7 +305,7 @@ def parse_args():
     parser.add_argument(
         '--action-score-thr',
         type=float,
-        default=0.5,
+        default=0.1,
         help='the threshold of human action score')
     parser.add_argument(
         '--label-map',
@@ -199,24 +316,31 @@ def parse_args():
     parser.add_argument(
         '--short-side',
         type=int,
-        default=256,
+        default=384,
         help='specify the short-side length of the image')
     parser.add_argument(
         '--predict-stepsize',
+        # default=1,
         default=8,
         type=int,
         help='give out a prediction per n frames')
     parser.add_argument(
         '--output-stepsize',
+        # default=1,
         default=4,
         type=int,
         help=('show one frame per n frames in the demo, we should have: '
               'predict_stepsize % output_stepsize == 0'))
     parser.add_argument(
         '--output-fps',
+        # default=-1,
         default=6,
         type=int,
         help='the fps of demo video output')
+    parser.add_argument(
+        '--output-video',
+        action='store_true',
+        help='output video')
     parser.add_argument(
         '--cfg-options',
         nargs='+',
@@ -227,14 +351,15 @@ def parse_args():
         "'--cfg-options model.backbone.depth=18 model.backbone.with_cp=True'")
     args = parser.parse_args()
     return args
-
+    
 
 def main():
     args = parse_args()
 
     tmp_dir = tempfile.TemporaryDirectory()
-    frame_paths, original_frames = frame_extract(
-        args.video, out_dir=tmp_dir.name)
+    output_path = os.path.join(tmp_dir.name, 'rotated_video.mp4')
+    ffmpeg.input(args.video).output(output_path, **{'metadata:s:v:0': 'rotate=0'}).overwrite_output().run()
+    frame_paths, original_frames = frame_extract(output_path, out_dir=tmp_dir.name)
     num_frame = len(frame_paths)
     h, w, _ = original_frames[0].shape
 
@@ -274,16 +399,29 @@ def main():
     center_frames = [frame_paths[ind - 1] for ind in timestamps]
 
     human_detections, _ = detection_inference(args.det_config,
-                                              args.det_checkpoint,
-                                              center_frames,
-                                              args.det_score_thr,
-                                              args.det_cat_id, args.device)
+                                            args.det_checkpoint,
+                                            center_frames,
+                                            args.det_score_thr,
+                                            args.det_cat_id, 
+                                            args.device,
+                                            with_score=True)  # Enable scores and tracking
     torch.cuda.empty_cache()
+    
+    # Extract tracking IDs from the detection results
+    tracking_ids = []
+    for det in human_detections:
+        if det.shape[1] > 5:  # If we have tracking IDs (bbox + score + track_id)
+            tracking_ids.append(det[:, 5].astype(np.int32))  # Get track IDs
+            det = det[:, :4]  # Keep only bbox coordinates for model input
+        else:
+            tracking_ids.append(np.full(det.shape[0], -1, dtype=np.int32))
+        
+    # Convert detections to tensor format for model input
     for i in range(len(human_detections)):
-        det = human_detections[i]
+        det = human_detections[i][:, :4]  # Use only bbox coordinates
         det[:, 0:4:2] *= w_ratio
         det[:, 1:4:2] *= h_ratio
-        human_detections[i] = torch.from_numpy(det[:, :4]).to(args.device)
+        human_detections[i] = torch.from_numpy(det).to(args.device)
 
     # Build STDET model
     try:
@@ -363,10 +501,23 @@ def main():
         for i in dense_timestamps(timestamps, dense_n)
     ]
     print('Performing visualization')
-    vis_frames = visualize(frames, results)
+    vis_frames = visualize(frames, results, tracking_ids)
+    if args.output_fps == -1:
+        video_capture = cv2.VideoCapture(args.video)
+        fps = video_capture.get(cv2.CAP_PROP_FPS)
+        video_capture.release()
+    else:
+        fps = args.output_fps
     vid = mpy.ImageSequenceClip([x[:, :, ::-1] for x in vis_frames],
-                                fps=args.output_fps)
-    vid.write_videofile(args.out_filename)
+                                fps=fps)
+    base_filename = os.path.splitext(os.path.basename(args.video))[0]
+    folder_path = os.path.dirname(os.path.abspath(__file__))
+    folder_path = os.path.join(folder_path, "mmaction_result")
+    os.makedirs(folder_path, exist_ok=True)
+    file_path = os.path.join(folder_path, base_filename+".mp4")
+    if args.output_video:
+        vid.write_videofile(file_path, codec="libx264")
+    log(frames, results, args.video, max_num=5, output_csv=args.output_csv, fps=fps, ids=tracking_ids)
 
     tmp_dir.cleanup()
 

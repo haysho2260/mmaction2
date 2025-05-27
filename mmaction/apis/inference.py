@@ -12,6 +12,7 @@ from mmengine.registry import init_default_scope
 from mmengine.runner import load_checkpoint
 from mmengine.structures import InstanceData
 from mmengine.utils import track_iter_progress
+from ultralytics import YOLO
 
 from mmaction.registry import MODELS
 from mmaction.structures import ActionDataSample
@@ -175,61 +176,59 @@ def detection_inference(det_config: Union[str, Path, mmengine.Config,
                         det_score_thr: float = 0.9,
                         det_cat_id: int = 0,
                         device: Union[str, torch.device] = 'cuda:0',
-                        with_score: bool = False) -> tuple:
+                        with_score: bool = True) -> tuple:
     """Detect human boxes given frame paths.
 
     Args:
         det_config (Union[str, :obj:`Path`, :obj:`mmengine.Config`,
             :obj:`torch.nn.Module`]):
-            Det config file path or Detection model object. It can be
-            a :obj:`Path`, a config object, or a module object.
-        det_checkpoint: Checkpoint path/url.
+            Det config file path or Detection model object.
+        det_checkpoint: Path to YOLO checkpoint (.pt file).
         frame_paths (List[str]): The paths of frames to do detection inference.
         det_score_thr (float): The threshold of human detection score.
             Defaults to 0.9.
         det_cat_id (int): The category id for human detection. Defaults to 0.
         device (Union[str, torch.device]): The desired device of returned
             tensor. Defaults to ``'cuda:0'``.
-        with_score (bool): Whether to append detection score after box.
-            Defaults to None.
+        with_score (bool): Whether to append detection score and tracking ID after box.
+            Defaults to True.
 
     Returns:
-        List[np.ndarray]: List of detected human boxes.
-        List[:obj:`DetDataSample`]: List of data samples, generally used
-            to visualize data.
+        List[np.ndarray]: List of detected human boxes with format [x1, y1, x2, y2] or 
+            [x1, y1, x2, y2, score, track_id] if with_score is True.
+        List[Dict]: List of metadata containing frame paths and raw detections.
     """
-    try:
-        from mmdet.apis import inference_detector, init_detector
-        from mmdet.structures import DetDataSample
-    except (ImportError, ModuleNotFoundError):
-        raise ImportError('Failed to import `inference_detector` and '
-                          '`init_detector` from `mmdet.apis`. These apis are '
-                          'required in this inference api! ')
-    if isinstance(det_config, nn.Module):
-        model = det_config
-    else:
-        model = init_detector(
-            config=det_config, checkpoint=det_checkpoint, device=device)
+    model = YOLO(det_checkpoint)
+    model.to(device)
 
     results = []
     data_samples = []
-    print('Performing Human Detection for each frame')
+
+    print('Performing Human Detection and Tracking for each frame')
     for frame_path in track_iter_progress(frame_paths):
-        det_data_sample: DetDataSample = inference_detector(model, frame_path)
-        pred_instance = det_data_sample.pred_instances.cpu().numpy()
-        bboxes = pred_instance.bboxes
-        scores = pred_instance.scores
-        # We only keep human detection bboxs with score larger
-        # than `det_score_thr` and category id equal to `det_cat_id`.
-        valid_idx = np.logical_and(pred_instance.labels == det_cat_id,
-                                   pred_instance.scores > det_score_thr)
+        # Run YOLO detection with tracking enabled
+        detections = model.track(frame_path, conf=det_score_thr, persist=True, verbose=False)[0]
+        boxes = detections.boxes
+        bboxes = boxes.xyxy.cpu().numpy()  # (N, 4)
+        scores = boxes.conf.cpu().numpy()  # (N,)
+        labels = boxes.cls.cpu().numpy()   # (N,)
+        track_ids = boxes.id.cpu().numpy() if boxes.id is not None else None  # (N,) tracking IDs
+
+        # Filter by label (person class)
+        valid_idx = labels == det_cat_id
         bboxes = bboxes[valid_idx]
         scores = scores[valid_idx]
+        track_ids = track_ids[valid_idx] if track_ids is not None else np.full(len(bboxes), -1)
 
         if with_score:
-            bboxes = np.concatenate((bboxes, scores[:, None]), axis=-1)
+            # Add scores and track IDs to bboxes
+            bboxes = np.concatenate((bboxes, scores[:, None], track_ids[:, None]), axis=-1)
+
         results.append(bboxes)
-        data_samples.append(det_data_sample)
+        data_samples.append({
+            'frame_path': frame_path,
+            'raw_result': detections
+        })
 
     return results, data_samples
 
