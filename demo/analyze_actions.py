@@ -6,42 +6,26 @@ from collections import defaultdict
 import os
 import glob
 import openpyxl
+import re
 
 def get_row_priority_action(row):
-    """Get the priority action for a single row, checking all action labels.
-    Priority order: getup > sit > bend/bow > walk
+    """Get the first priority action found in any action label.
+    Checks action labels in order (0-4) and returns the first priority action found.
     
     Args:
         row (pd.Series): Single row from DataFrame containing action labels
         
     Returns:
-        str or None: Priority action for this row, or None if no priority action found
+        str or None: First priority action found, or None if no priority action found
     """
-    # First check action_label_0
-    if 'action_label_0' in row and pd.notna(row['action_label_0']):
-        action = row['action_label_0'].lower()
-        if 'getup' in action:
-            return 'getup'
-        elif 'sit' in action:
-            return 'sit'
-        elif 'bend/bow (at the waist)' in action:
-            return 'bend/bow (at the waist)'
-        elif 'walk' in action:
-            return 'walk'
-    
-    # If no priority action in action_label_0, check other labels
-    for i in range(1, 5):
+    # Check each action label in order (0-4)
+    for i in range(5):
         action_col = f'action_label_{i}'
         if action_col in row and pd.notna(row[action_col]):
             action = row[action_col].lower()
-            if 'getup' in action:
-                return 'getup'
-            elif 'sit' in action:
-                return 'sit'
-            elif 'bend/bow (at the waist)' in action:
-                return 'bend/bow (at the waist)'
-            elif 'walk' in action:
-                return 'walk'
+            # Return the first priority action found
+            if any(key in action for key in ['getup', 'sit', 'bend/bow (at the waist)', 'stand', 'walk']):
+                return action
     
     return None
 
@@ -58,10 +42,18 @@ def get_primary_action(frame_rows):
     """
     # Get priority action for each row
     row_actions = []
+    
+    # Get frame number and time information
+    frame_num = frame_rows['frame'].iloc[0]
+    fps = frame_rows['fps'].iloc[0]
+    time_sec = frame_num / fps
+    
     for _, row in frame_rows.iterrows():
         action = get_row_priority_action(row)
         if action:
             row_actions.append(action)
+    
+    print(f"Frame {frame_num} (Time: {time_sec:.2f}s) - Actions: {row_actions}")
     
     # If no priority actions found in any row
     if not row_actions:
@@ -74,6 +66,8 @@ def get_primary_action(frame_rows):
         return 'sit'
     elif 'bend/bow (at the waist)' in row_actions:
         return 'bend/bow (at the waist)'
+    elif 'stand' in row_actions:
+        return 'stand'
     elif 'walk' in row_actions:
         return 'walk'
     
@@ -81,28 +75,28 @@ def get_primary_action(frame_rows):
 
 def is_active_state(action):
     """Determine if an action represents an active (standing/walking) state."""
-    return action in ['stand', 'walk']
+    return action in ['stand', 'walk', 'getup', 'bend/bow (at the waist)']
 
 def is_inactive_state(action):
     """Determine if an action represents an inactive (sitting/bending) state."""
-    return action in ['sit', 'getup', 'bend/bow (at the waist)']
+    return action in ['sit']
 
 def find_activity_periods(df, fps):
-    """Find periods of activity (standing/walking) between inactive states.
+    """Find the duration between first inactive-to-active transition and last active-to-inactive transition.
     
     Args:
         df (pd.DataFrame): DataFrame containing actions for one video
         fps (float): Frames per second of the video
         
     Returns:
-        list: List of dictionaries containing activity periods
+        dict: Dictionary containing the first-to-last activity period, or None if no valid transitions found
     """
     # Sort by frame number and group by frame
     df = df.sort_values('frame')
-    activity_periods = []
     
     current_state = None
-    activity_start_frame = None
+    first_transition_frame = None
+    last_transition_frame = None
     
     # Process frame by frame
     for frame_num, frame_group in df.groupby('frame'):
@@ -110,42 +104,48 @@ def find_activity_periods(df, fps):
         if not current_action:
             continue
             
-        # Detect transitions between active and inactive states
+        # Initialize state if None
         if current_state is None:
             current_state = current_action
             continue
             
         # If we transition from inactive to active state
         if is_inactive_state(current_state) and is_active_state(current_action):
-            activity_start_frame = frame_num
+            # Record first transition if we haven't seen one yet
+            if first_transition_frame is None:
+                first_transition_frame = frame_num
             
-        # If we transition from active to inactive state and we had a start frame
-        elif is_active_state(current_state) and is_inactive_state(current_action) and activity_start_frame is not None:
-            duration = (frame_num - activity_start_frame) / fps
-            activity_periods.append({
-                'start_frame': activity_start_frame,
-                'end_frame': frame_num,
-                'duration': duration,
-                'start_time': activity_start_frame / fps,
-                'end_time': frame_num / fps
-            })
-            activity_start_frame = None
+        # If we transition from active to inactive state
+        elif is_active_state(current_state) and is_inactive_state(current_action):
+            # Always update last transition when we see one
+            last_transition_frame = frame_num
             
         current_state = current_action
     
+    # If we found both transitions, return the period
+    if first_transition_frame is not None and last_transition_frame is not None:
+        duration = (last_transition_frame - first_transition_frame) / fps
+        return [{
+            'start_frame': first_transition_frame,
+            'end_frame': last_transition_frame,
+            'duration': duration,
+            'start_time': first_transition_frame / fps,
+            'end_time': last_transition_frame / fps
+        }]
+    
     # Handle case where video ends during active period
-    if activity_start_frame is not None and is_active_state(current_state):
+    elif first_transition_frame is not None and is_active_state(current_state):
         last_frame = df['frame'].max()
-        duration = (last_frame - activity_start_frame) / fps
-        activity_periods.append({
-            'start_frame': activity_start_frame,
+        duration = (last_frame - first_transition_frame) / fps
+        return [{
+            'start_frame': first_transition_frame,
             'end_frame': last_frame,
             'duration': duration,
-            'start_time': activity_start_frame / fps,
+            'start_time': first_transition_frame / fps,
             'end_time': last_frame / fps
-        })
+        }]
     
-    return activity_periods
+    return []
 
 def extract_video_info(filename):
     """Extract institution and participant ID from various video filename formats.
@@ -191,6 +191,12 @@ def find_ground_truth_file(filename):
         print(f"Could not parse video name format: {filename}")
         return None
         
+    # Extract test number if present (e.g., tug_3, tug2, etc.)
+    test_number = None
+    test_number_match = re.search(r'[_-]?(\d+)(?:\.|$)', filename)
+    if test_number_match:
+        test_number = test_number_match.group(1)
+    
     # Map test types to search patterns
     test_patterns = {
         'tug': ['*tug*', '*TUG*'],
@@ -203,7 +209,35 @@ def find_ground_truth_file(filename):
     search_patterns = []
     for test_key, patterns in test_patterns.items():
         if test_key in test_type.lower():
-            search_patterns.extend(patterns)
+            base_patterns = patterns
+            # If we have a test number, add more specific patterns
+            if test_number:
+                # Add patterns with different number formats
+                number_patterns = [
+                    f'*{p[:-1]}{test_number}*' for p in patterns  # e.g., *tug3*
+                ] + [
+                    f'*{p[:-1]}_{test_number}*' for p in patterns  # e.g., *tug_3*
+                ] + [
+                    f'*{p[:-1]}-{test_number}*' for p in patterns  # e.g., *tug-3*
+                ]
+                # Put more specific patterns first
+                search_patterns.extend(number_patterns)
+            else:
+                # If no test number in filename, try both unnumbered and number 1 patterns
+                number_one_patterns = [
+                    f'*{p[:-1]}1*' for p in patterns  # e.g., *tug1*
+                ] + [
+                    f'*{p[:-1]}_1*' for p in patterns  # e.g., *tug_1*
+                ] + [
+                    f'*{p[:-1]}-1*' for p in patterns  # e.g., *tug-1*
+                ]
+                # Put base patterns first for unnumbered files, then try number 1 patterns
+                search_patterns.extend(base_patterns)
+                search_patterns.extend(number_one_patterns)
+            
+            # Add base patterns as fallback if we had a test number
+            if test_number:
+                search_patterns.extend(base_patterns)
             break
     
     if not search_patterns:
@@ -230,6 +264,9 @@ def find_ground_truth_file(filename):
             pattern = f"{ground_truth_dir}/*{id_pat}*{test_pat}*.xlsx"
             matching_files = glob.glob(pattern)
             if matching_files:
+                # If we found a match and we're using base patterns, print a warning if it contains a number
+                if test_number is None and any(re.search(r'(?:^|[_-])1(?:\D|$)', f) for f in matching_files):
+                    print(f"Warning: Unnumbered video file {filename} matched with a numbered ground truth file {matching_files[0]}")
                 return matching_files[0]
     
     print(f"No matching ground truth file found for {institution} participant {participant_id} {test_type} test")
@@ -262,16 +299,18 @@ def get_ground_truth_times(excel_path):
         start_row = None
         stop_row = None
         
+        # Find first occurrence of start marker
         for marker in start_markers:
             mask = df[behavior_col].str.contains(marker, na=False, case=False)
             if mask.any():
                 start_row = df[mask].iloc[0]
                 break
                 
+        # Find last occurrence of stop marker
         for marker in stop_markers:
             mask = df[behavior_col].str.contains(marker, na=False, case=False)
             if mask.any():
-                stop_row = df[mask].iloc[0]
+                stop_row = df[mask].iloc[-1]  # Changed from iloc[0] to iloc[-1]
                 break
         
         if start_row is None or stop_row is None:
@@ -312,6 +351,96 @@ def get_ground_truth_times(excel_path):
         print(f"Error reading ground truth file: {e}")
         return None
 
+def interpolate_missing_tracks(df):
+    """Fill in missing frames for each track ID by interpolating between known frames.
+    
+    Args:
+        df (pd.DataFrame): DataFrame containing action detections
+        
+    Returns:
+        pd.DataFrame: DataFrame with interpolated rows for missing frames
+    """
+    # Sort by track_id and frame
+    df = df.sort_values(['track_id', 'frame'])
+    
+    # Create a list to store interpolated rows
+    interpolated_rows = []
+    
+    # Process each track_id separately
+    for track_id, track_df in df.groupby('track_id'):
+        frames = track_df['frame'].values
+        
+        # Find gaps in frames
+        for i in range(len(frames) - 1):
+            current_frame = frames[i]
+            next_frame = frames[i + 1]
+            frame_gap = next_frame - current_frame
+            
+            # If there's a small gap (e.g., 5 frames or less), interpolate
+            if 1 < frame_gap <= 5:
+                print(f"\nInterpolating track_id {track_id} between frames {current_frame} and {next_frame}")
+                
+                # Get the rows before and after the gap
+                before_row = track_df[track_df['frame'] == current_frame].iloc[0]
+                after_row = track_df[track_df['frame'] == next_frame].iloc[0]
+                
+                # Get priority actions for before and after frames
+                before_action = get_row_priority_action(before_row)
+                after_action = get_row_priority_action(after_row)
+                print(f"  Before gap: {before_action}, After gap: {after_action}")
+                
+                # Only interpolate if the actions are consistent or follow logical progression
+                should_interpolate = True
+                if before_action != after_action:
+                    # If walking on either side, don't introduce sitting/bending
+                    if ('walk' in [before_action, after_action] and 
+                        any(a in ['sit', 'bend/bow (at the waist)'] for a in [before_action, after_action])):
+                        print(f"  Skipping interpolation due to inconsistent actions: {before_action} -> {after_action}")
+                        should_interpolate = False
+                
+                if should_interpolate:
+                    # Interpolate for each missing frame
+                    for missing_frame in range(int(current_frame + 1), int(next_frame)):
+                        # Calculate interpolation factor
+                        alpha = (missing_frame - current_frame) / frame_gap
+                        
+                        # Create interpolated row
+                        new_row = before_row.copy()
+                        new_row['frame'] = missing_frame
+                        
+                        # Interpolate bounding box coordinates
+                        for coord in ['bbox_x1', 'bbox_y1', 'bbox_x2', 'bbox_y2']:
+                            new_row[coord] = int(before_row[coord] * (1 - alpha) + after_row[coord] * alpha)
+                        
+                        # For actions, use the higher priority action if they're different
+                        if before_action == after_action:
+                            # If actions are the same, keep them
+                            action_to_use = before_action
+                        else:
+                            # If actions are different, use the one with higher priority
+                            priority_order = ['getup', 'sit', 'bend/bow (at the waist)', 'walk']
+                            before_priority = priority_order.index(before_action) if before_action in priority_order else len(priority_order)
+                            after_priority = priority_order.index(after_action) if after_action in priority_order else len(priority_order)
+                            action_to_use = before_action if before_priority <= after_priority else after_action
+                        
+                        # Set the interpolated action
+                        new_row['action_label_0'] = action_to_use
+                        # Clear other action labels to avoid conflicts
+                        for i in range(1, 5):
+                            new_row[f'action_label_{i}'] = None
+                            new_row[f'action_score_{i}'] = 0.0
+                        
+                        interpolated_rows.append(new_row)
+                        print(f"  Added interpolated frame {missing_frame} with action {action_to_use}")
+    
+    # If we have interpolated rows, add them to the original DataFrame
+    if interpolated_rows:
+        interpolated_df = pd.DataFrame(interpolated_rows)
+        df = pd.concat([df, interpolated_df], ignore_index=True)
+        df = df.sort_values(['track_id', 'frame'])
+    
+    return df
+
 def analyze_video_actions(df, filename, results_list):
     """Analyze action transitions for a specific video.
     
@@ -324,6 +453,10 @@ def analyze_video_actions(df, filename, results_list):
     
     print(f"\nAnalyzing video: {filename}")
     
+    # Interpolate missing frames before analysis
+    print("\nChecking for missing frames and interpolating...")
+    df = interpolate_missing_tracks(df)
+    
     # Find activity periods from our detection
     activity_periods = find_activity_periods(df, fps)
     
@@ -331,7 +464,9 @@ def analyze_video_actions(df, filename, results_list):
     result = {
         'filename': filename,
         'detected_periods': len(activity_periods),
-        'ground_truth_found': False
+        'ground_truth_found': False,
+        'ground_truth_file': None,  # Initialize ground truth file path
+        'ground_truth_label_file': None  # Initialize ground truth label file path
     }
     
     if activity_periods:
@@ -339,24 +474,18 @@ def analyze_video_actions(df, filename, results_list):
         # Use the first period for comparison (assuming single activity period per video)
         period = activity_periods[0]
         result.update({
-            'detected_start_frame': period['start_frame'],
-            'detected_end_frame': period['end_frame'],
             'detected_start_time': round(period['start_time'], 2),
             'detected_end_time': round(period['end_time'], 2),
             'detected_duration': round(period['duration'], 2)
         })
         
-        print(f"\nPeriod:")
-        print(f"  Start Frame: {period['start_frame']}")
-        print(f"  End Frame: {period['end_frame']}")
+        print(f"\nPredicted:")
         print(f"  Start Time: {period['start_time']:.2f} seconds")
         print(f"  End Time: {period['end_time']:.2f} seconds")
         print(f"  Duration: {period['duration']:.2f} seconds")
     else:
         print("\nNo activity periods detected.")
         result.update({
-            'detected_start_frame': None,
-            'detected_end_frame': None,
             'detected_start_time': None,
             'detected_end_time': None,
             'detected_duration': None
@@ -369,9 +498,9 @@ def analyze_video_actions(df, filename, results_list):
         ground_truth = get_ground_truth_times(ground_truth_file)
         if ground_truth:
             result['ground_truth_found'] = True
+            result['ground_truth_file'] = df['ground_truth_file'].iloc[0] if 'ground_truth_file' in df.columns else None
+            result['ground_truth_label_file'] = ground_truth_file
             result.update({
-                'ground_truth_start_frame': ground_truth.get('start_frame'),
-                'ground_truth_end_frame': ground_truth.get('stop_frame'),
                 'ground_truth_start_time': round(ground_truth['start_time'], 2),
                 'ground_truth_end_time': round(ground_truth['stop_time'], 2),
                 'ground_truth_duration': round(ground_truth['duration'], 2)
@@ -380,29 +509,20 @@ def analyze_video_actions(df, filename, results_list):
             # Calculate differences if we have both detection and ground truth
             if activity_periods:
                 result.update({
-                    'start_frame_diff': period['start_frame'] - ground_truth['start_frame'] if 'start_frame' in ground_truth else None,
-                    'end_frame_diff': period['end_frame'] - ground_truth['stop_frame'] if 'stop_frame' in ground_truth else None,
                     'start_time_diff': round(period['start_time'] - ground_truth['start_time'], 2),
                     'end_time_diff': round(period['end_time'] - ground_truth['stop_time'], 2),
                     'duration_diff': round(period['duration'] - ground_truth['duration'], 2)
                 })
             
-            if ground_truth.get('start_frame') is not None:
-                print(f"  Start Frame: {ground_truth['start_frame']}")
-                print(f"  Stop Frame: {ground_truth['stop_frame']}")
             print(f"  Test Start Time: {ground_truth['start_time']:.2f} seconds")
             print(f"  Test Stop Time: {ground_truth['stop_time']:.2f} seconds")
             print(f"  Test Duration: {ground_truth['duration']:.2f} seconds")
     else:
         print("\nNo ground truth file found.")
         result.update({
-            'ground_truth_start_frame': None,
-            'ground_truth_end_frame': None,
             'ground_truth_start_time': None,
             'ground_truth_end_time': None,
             'ground_truth_duration': None,
-            'start_frame_diff': None,
-            'end_frame_diff': None,
             'start_time_diff': None,
             'end_time_diff': None,
             'duration_diff': None

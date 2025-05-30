@@ -20,7 +20,7 @@ def get_next_results_number(mmaction_base_dir):
 def run_detection_on_videos(
     root_dir: str,
     filter_tug: bool = True,
-    device: str = "cuda:0",
+    device: str = "cuda:2",
     resume_from: str = None,
     output_csv: str = None
 ):
@@ -59,7 +59,7 @@ def run_detection_on_videos(
                     resume_found = True
                 else:
                     continue  # Skip until we find the resume point
-            
+                
             count += 1
             video_path = Path(dirpath) / filename
             video_path_str = str(video_path.resolve())
@@ -71,7 +71,7 @@ def run_detection_on_videos(
                 "--device",
                 device,
                 "--output-csv",
-                results_file
+                results_file,
             ]
 
             print(f"\nProcessing video: {video_path_str}")
@@ -84,6 +84,6 @@ if __name__ == "__main__":
     # Example usage: To resume from UWisc_1160 and append to results_0.csv
     run_detection_on_videos(
         "/files/pathml/aim2/videos/",
-        resume_from="blurred_T28_TUG_2",  # Change this to None to process all files
+        resume_from=None,  # Change this to None to process all files
         output_csv="/code/hchang27/mmaction2/demo/mmaction_result/results_0.csv"
     )

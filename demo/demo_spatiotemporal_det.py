@@ -176,7 +176,7 @@ def log(frames, annotations, video, max_num=5, output_csv=None, fps=30, ids=None
         # Write headers only if file is new
         if not file_exists:
             writer.writerow(
-                ['filename', 'frame', 'fps', 'track_id'] + 
+                ['filename', 'fps', 'track_id', 'ground_truth_file'] + 
                 [elem for i in range(max_num) for elem in [f'action_label_{i}', f'action_score_{i}']] + 
                 ['bbox_x1', 'bbox_y1', 'bbox_x2', 'bbox_y2']
             )
@@ -189,7 +189,6 @@ def log(frames, annotations, video, max_num=5, output_csv=None, fps=30, ids=None
             frame_ids = ids[i] if ids is not None and i < len(ids) else None
             
             for j in range(nfpa):
-                ind = i * nfpa + j
                 for ann_idx, ann in enumerate(anno):
                     box = ann[0]
                     labels = ann[1]
@@ -212,7 +211,7 @@ def log(frames, annotations, video, max_num=5, output_csv=None, fps=30, ids=None
                         label_texts.extend([label.replace(",", ";"), score])
 
                     track_id = frame_ids[ann_idx] if frame_ids is not None and ann_idx < len(frame_ids) else -1
-                    writer.writerow([base_filename, ind, fps, track_id] + label_texts + [x1, y1, x2, y2])
+                    writer.writerow([base_filename, fps, track_id, base_filename] + label_texts + [x1, y1, x2, y2])
     
     print(f"Results {'appended to' if file_exists else 'written to'} {csv_filename}")
     return frames_out
@@ -320,21 +319,18 @@ def parse_args():
         help='specify the short-side length of the image')
     parser.add_argument(
         '--predict-stepsize',
-        # default=1,
         default=8,
         type=int,
         help='give out a prediction per n frames')
     parser.add_argument(
         '--output-stepsize',
-        # default=1,
         default=4,
         type=int,
         help=('show one frame per n frames in the demo, we should have: '
               'predict_stepsize % output_stepsize == 0'))
     parser.add_argument(
         '--output-fps',
-        # default=-1,
-        default=6,
+        default=-1,
         type=int,
         help='the fps of demo video output')
     parser.add_argument(
@@ -502,12 +498,33 @@ def main():
     ]
     print('Performing visualization')
     vis_frames = visualize(frames, results, tracking_ids)
+    # Calculate the exact fps needed for original duration
+    video_capture = cv2.VideoCapture(args.video)
+    original_fps = video_capture.get(cv2.CAP_PROP_FPS)
+    total_frames = int(video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    original_duration = total_frames / original_fps
+    video_capture.release()
     if args.output_fps == -1:
-        video_capture = cv2.VideoCapture(args.video)
-        fps = video_capture.get(cv2.CAP_PROP_FPS)
-        video_capture.release()
+        # Calculate exact fps needed to maintain original duration
+        fps = len(vis_frames) / original_duration
     else:
-        fps = args.output_fps
+        exact_fps = len(vis_frames) / original_duration
+        requested_fps = args.output_fps
+        
+        # Find number of frames needed at requested fps to maintain duration
+        ideal_frame_count = requested_fps * original_duration
+        
+        # If we need to drop frames
+        if len(vis_frames) > ideal_frame_count:
+            # Calculate step size to get as close as possible to requested fps
+            step = len(vis_frames) / ideal_frame_count
+            indices = [int(i * step) for i in range(int(ideal_frame_count))]
+            vis_frames = [vis_frames[i] for i in indices]
+            fps = requested_fps
+        else:
+            # If we don't have enough frames for requested fps, use exact fps
+            fps = exact_fps
+    
     vid = mpy.ImageSequenceClip([x[:, :, ::-1] for x in vis_frames],
                                 fps=fps)
     base_filename = os.path.splitext(os.path.basename(args.video))[0]
