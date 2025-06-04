@@ -176,7 +176,7 @@ def log(frames, annotations, video, max_num=5, output_csv=None, fps=30, ids=None
         # Write headers only if file is new
         if not file_exists:
             writer.writerow(
-                ['filename', 'fps', 'track_id', 'ground_truth_file'] + 
+                ['filename', 'fps', 'frames', 'track_id', 'detected_file'] + 
                 [elem for i in range(max_num) for elem in [f'action_label_{i}', f'action_score_{i}']] + 
                 ['bbox_x1', 'bbox_y1', 'bbox_x2', 'bbox_y2']
             )
@@ -211,7 +211,8 @@ def log(frames, annotations, video, max_num=5, output_csv=None, fps=30, ids=None
                         label_texts.extend([label.replace(",", ";"), score])
 
                     track_id = frame_ids[ann_idx] if frame_ids is not None and ann_idx < len(frame_ids) else -1
-                    writer.writerow([base_filename, fps, track_id, base_filename] + label_texts + [x1, y1, x2, y2])
+                    frame_number = i * nfpa + j
+                    writer.writerow([base_filename, fps, frame_number, track_id, base_filename] + label_texts + [x1, y1, x2, y2])
     
     print(f"Results {'appended to' if file_exists else 'written to'} {csv_filename}")
     return frames_out
